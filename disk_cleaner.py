@@ -1,0 +1,237 @@
+import os
+import time
+import pandas as pd
+import numpy as np
+import zipfile 
+import sys
+import joblib # Thư viện để tải mô hình đã huấn luyện
+from pathlib import Path
+
+# ==================== CẤU HÌNH VÀ VỊ TRÍ LƯU TRỮ MÔ HÌNH ====================
+# Thư mục lưu trữ mô hình đã huấn luyện (Được tạo bởi train_model.py)
+ASSETS_DIR = Path("ml_assets")
+MODEL_FILE = ASSETS_DIR / "disk_model.joblib"
+ENCODER_FILE = ASSETS_DIR / "label_encoder.joblib"
+
+# Các ngưỡng này được dùng để tính toán Features (đặc trưng) trên dữ liệu thật.
+# Chúng cần phải nhất quán với các ngưỡng đã dùng trong train_model.py
+DELETE_SIZE_THRESHOLD = 5 * 1024 * 1024   # 5MB
+DELETE_TIME_THRESHOLD = 180               # 180 ngày
+
+COMPRESS_SIZE_THRESHOLD = 50 * 1024 * 1024 # 50MB
+COMPRESS_TIME_THRESHOLD = 90              # 90 ngày
+COMPRESSED_EXTS = [".zip", ".rar", ".7z", ".tar.gz", ".gz"]
+# ==============================================================================
+
+
+# ----------------- HÀM THU THẬP METADATA THẬT -----------------
+def collect_real_metadata(target_dir_path):
+    """Quét thư mục thực, thu thập metadata của các tệp (trừ thư mục)."""
+    
+    current_time = time.time()
+    file_data_list = []
+    total_files = 0
+    
+    print(f"\n[BƯỚC 2] Bắt đầu quét thư mục thực: {target_dir_path.resolve()}")
+    
+    # Sử dụng rglob để quét đệ quy (bao gồm các thư mục con)
+    for item_path in target_dir_path.rglob('*'):
+        if item_path.is_file():
+            total_files += 1
+            try:
+                stat_info = item_path.stat()
+                
+                if item_path.is_symlink():
+                    continue
+
+                size_bytes = stat_info.st_size
+                # st_atime: thời gian truy cập cuối cùng (last access time)
+                days_since_access = (current_time - stat_info.st_atime) / (24 * 3600)
+                
+                # Bỏ qua các tệp quá mới (< 7 ngày)
+                if days_since_access < 7: continue
+
+                file_data_list.append({
+                    'file_path': item_path.as_posix(),
+                    'size_bytes': size_bytes,
+                    'extension': item_path.suffix.lower(),
+                    'days_since_access': days_since_access,
+                })
+
+            except Exception as e:
+                print(f"Lỗi khi xử lý {item_path}: {e}")
+                continue
+
+    print(f"Hoàn tất quét. Thu thập được {len(file_data_list)}/{total_files} tệp hợp lệ.")
+    return pd.DataFrame(file_data_list)
+
+# -------------------- HÀM CHỈ TÍNH TOÁN FEATURE --------------------
+def calculate_features(df):
+    """
+    Tính toán Features (đặc trưng) cần thiết cho mô hình. 
+    """
+    if df.empty:
+        return df
+
+    # Đặc trưng 1: Là file tạm thời/rác hay không
+    temp_extensions = [".log", ".tmp", ".bak", ".cache", ".~", ""]
+    df['is_temp_file'] = df['extension'].isin(temp_extensions).astype(int)
+
+    # Đặc trưng 2: Kích thước tệp (dùng log scale như khi train)
+    df['size_log'] = np.log10(df['size_bytes'] + 1)
+    
+    # Đặc trưng 3: Thời gian kể từ lần truy cập cuối cùng (days_since_access)
+    
+    return df
+
+# ----------------- HÀM ĐỊNH DẠNG KÍCH THƯỚC -----------------
+def format_size(size_bytes):
+    """Chuyển đổi kích thước tệp từ bytes sang định dạng dễ đọc (KB, MB, GB)."""
+    if size_bytes >= (1024**3):
+        return f"{size_bytes / (1024**3):.2f} GB"
+    elif size_bytes >= (1024**2):
+        return f"{size_bytes / (1024**2):.2f} MB"
+    else:
+        return f"{size_bytes / 1024:.2f} KB"
+
+# ----------------- HÀM TƯƠNG TÁC VÀ THỰC THI HÀNH ĐỘNG -----------------
+def confirm_and_act(suggestions_df, target_dir):
+    """Hỏi người dùng và thực hiện hành động THỰC TẾ."""
+    
+    if suggestions_df.empty:
+        return
+
+    # Lấy nhãn dự đoán cho hành động hiện tại (Delete hoặc Compress)
+    action_type = suggestions_df['Predicted_Label'].iloc[0]
+    
+    print(f"\nBạn có muốn thực hiện hành động '{action_type}' trên {len(suggestions_df)} tệp này không?")
+    
+    # Hiển thị thông tin tệp cho người dùng
+    display_cols = ['file_path', 'Formatted_Size', 'days_since_access']
+    print(suggestions_df[display_cols].to_string(index=False))
+    
+    response = input("Nhập 'y' để xác nhận thực hiện hoặc bất kỳ phím nào khác để bỏ qua: ").lower()
+    
+    if response == 'y':
+        print(f"\n--- Thực hiện {action_type} THỰC TẾ ---")
+        for index, row in suggestions_df.iterrows():
+            file_path = Path(row['file_path'])
+            
+            if action_type == 'Delete':
+                try:
+                    file_path.unlink() # THỰC HIỆN XÓA TỆP THẬT SỰ
+                    print(f"   [XÓA THỰC TẾ] Đã xóa: {file_path.name}")
+                except Exception as e:
+                    print(f"   [LỖI XÓA] Không thể xóa {file_path.name}: {e}")
+
+            elif action_type == 'Compress':
+                # Tạo thư mục Archive
+                archive_dir = target_dir / "ARCHIVE_ML_ASSISTANT"
+                archive_dir.mkdir(exist_ok=True)
+                
+                zip_path = archive_dir / f"{file_path.stem}.zip"
+                
+                try:
+                    # THỰC HIỆN NÉN TỆP THẬT SỰ
+                    print(f"   [NÉN THỰC TẾ] Đang nén {file_path.name}...")
+                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                        zipf.write(file_path, file_path.name) 
+                    
+                    # Xóa tệp gốc sau khi nén thành công
+                    file_path.unlink()
+                    print(f"   [HOÀN TẤT] Đã nén và xóa gốc: {file_path.name}")
+                    
+                except Exception as e:
+                    print(f"   [LỖI NÉN] Không thể nén {file_path.name}: {e}")
+
+        print(f"Hoàn tất hành động '{action_type}'.")
+    else:
+        print("Hủy bỏ hành động.")
+
+
+# ========================= HÀM CHÍNH (MAIN FUNCTION) =========================
+def main():
+    
+    print("================== TRỢ LÝ DỌN DẸP ĐĨA ML - ỨNG DỤNG ===================")
+    
+    # -------------------------------------------------------------
+    # BƯỚC 0: TẢI MÔ HÌNH VÀ BỘ MÃ HÓA
+    # -------------------------------------------------------------
+    try:
+        model = joblib.load(MODEL_FILE)
+        le = joblib.load(ENCODER_FILE)
+        print(f"[BƯỚC 0] Đã tải mô hình từ: {MODEL_FILE}")
+    except FileNotFoundError:
+        print("\n[LỖI QUAN TRỌNG] Không tìm thấy file mô hình!")
+        print(f"Vui lòng chạy file 'train_model.py' trước để tạo {MODEL_FILE} và {ENCODER_FILE}.")
+        sys.exit(1)
+    
+    # -------------------------------------------------------------
+    # BƯỚC 1: XÁC ĐỊNH THƯ MỤC THẬT TẾ
+    # -------------------------------------------------------------
+    while True:
+        target_path_str = input("\n[BƯỚC 1] Nhập đường dẫn thư mục CẦN DỌN DẸP (Ví dụ: /home/user/Downloads): ")
+        target_dir = Path(target_path_str)
+        if target_dir.is_dir():
+            break
+        else:
+            print("Đường dẫn không hợp lệ hoặc không phải là thư mục. Vui lòng thử lại.")
+            
+    # -------------------------------------------------------------
+    # BƯỚC 2: THU THẬP DỮ LIỆU THẬT & TÍNH TOÁN FEATURE
+    # -------------------------------------------------------------
+    real_metadata_df = collect_real_metadata(target_dir)
+
+    if real_metadata_df.empty:
+        print("Không tìm thấy tệp nào đủ điều kiện để phân tích. Thoát chương trình.")
+        sys.exit(0) 
+        
+    real_df = calculate_features(real_metadata_df) 
+    
+    # -------------------------------------------------------------
+    # BƯỚC 3: DỰ ĐOÁN & BÁO CÁO
+    # -------------------------------------------------------------
+    print("\n[BƯỚC 3] Áp dụng mô hình đã huấn luyện để dự đoán hành động trên dữ liệu thật...")
+    
+    # Chọn các cột feature mà mô hình đã được huấn luyện
+    X_real = real_df[['size_log', 'days_since_access', 'is_temp_file']]
+    
+    # Dự đoán
+    all_predictions_encoded = model.predict(X_real)
+    real_df['Predicted_Label'] = le.inverse_transform(all_predictions_encoded)
+    
+    # Phân loại kết quả
+    action_df = real_df[real_df['Predicted_Label'] != 'Keep'].copy()
+    action_df['Formatted_Size'] = action_df['size_bytes'].apply(format_size)
+
+    delete_suggestions = action_df[action_df['Predicted_Label'] == 'Delete'] \
+        .sort_values(by='size_bytes', ascending=False)
+    compress_suggestions = action_df[action_df['Predicted_Label'] == 'Compress'] \
+        .sort_values(by='size_bytes', ascending=False)
+
+    print("\n=============== BÁO CÁO ĐỀ XUẤT DỌN DẸP ===============")
+    
+    # Báo cáo Xóa
+    print("\n--- 🗑️ Đề Xuất XÓA (Delete) ---")
+    if not delete_suggestions.empty:
+        print(f"Tổng số tệp đề xuất xóa: {len(delete_suggestions)}")
+        print("Danh sách TOP 5 tệp cần xóa (theo kích thước):")
+        print(delete_suggestions.head(5).to_string(columns=['file_path', 'Formatted_Size', 'days_since_access'], index=False))
+        confirm_and_act(delete_suggestions.head(5), target_dir) 
+    else:
+        print("Không có tệp nào được đề xuất xóa.")
+
+    # Báo cáo Nén
+    print("\n--- 📦 Đề Xuất NÉN/LƯU TRỮ (Compress) ---")
+    if not compress_suggestions.empty:
+        print(f"Tổng số tệp đề xuất nén: {len(compress_suggestions)}")
+        print("Danh sách TOP 5 tệp cần nén:")
+        print(compress_suggestions.head(5).to_string(columns=['file_path', 'Formatted_Size', 'days_since_access'], index=False))
+        confirm_and_act(compress_suggestions.head(5), target_dir)
+    else:
+        print("Không có tệp nào được đề xuất nén.")
+
+    print("\n================== CHƯƠNG TRÌNH KẾT THÚC ==================")
+
+if __name__ == '__main__':
+    main()
