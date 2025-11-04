@@ -5,7 +5,14 @@ python-dateutil==2.9.0.post0
 pytz==2025.2
 scikit-learn==1.7.2
 scipy==1.16.3
-Send2Trash==1.8.3
 six==1.17.0
 threadpoolctl==3.6.0
 tzdata==2025.2
+spacy>=3.7.0
+transformers>=4.30.0
+torch>=2.0.0
+
+# Lưu ý: Sau khi cài đặt spacy, bạn cần tải mô hình ngôn ngữ:
+# python -m spacy download en_core_web_lg
+#
+# Transformers sẽ tự động tải mô hình "sentence-transformers/all-MiniLM-L6-v2" khi chạy lần đầu
