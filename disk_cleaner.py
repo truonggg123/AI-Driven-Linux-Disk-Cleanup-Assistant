@@ -11,8 +11,13 @@ import sys
 from datetime import datetime
 from send2trash import send2trash
 import spacy
-from transformers import AutoTokenizer, AutoModel
-import torch
+try:
+    from transformers import AutoTokenizer, AutoModel
+    import torch
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
+    print("[Cảnh báo] PyTorch/Transformers không được cài đặt. Chỉ sử dụng spaCy.")
 
 # CÁC BIẾN HẰNG
 ASSETS_DIR = Path("ml_assets")
@@ -58,17 +63,24 @@ CRITICAL_PATHS = [
 # ----------------- HÀM TRÍCH XUẤT EMBEDDING TỪ TRANSFORMERS -----------------
 def get_transformer_embedding(text, tokenizer, model, max_length=128):
     """
-    Lấy embedding từ transformer model.
+    Lấy embedding từ transformer model (chạy trên CPU).
     """
     if tokenizer is None or model is None:
         return None
     
+    if not HAS_TRANSFORMERS:
+        return None
+    
     try:
+        import torch
         # Tokenize
         inputs = tokenizer(text, return_tensors="pt", max_length=max_length, 
                           truncation=True, padding=True)
         
-        # Lấy embeddings
+        # Đảm bảo inputs ở trên CPU
+        inputs = {k: v.to('cpu') for k, v in inputs.items()}
+        
+        # Lấy embeddings (CPU mode)
         with torch.no_grad():
             outputs = model(**inputs)
             # Lấy mean pooling của token embeddings
@@ -160,12 +172,25 @@ class DiskCleanerApp:
             return
         
         # Khởi tạo Transformers model (sử dụng mô hình nhẹ cho text embeddings)
+        # LƯU Ý: PyTorch sẽ chạy ở chế độ CPU (không cần NVIDIA GPU)
         try:
+            # Đảm bảo PyTorch sử dụng CPU
+            import torch
+            if torch.cuda.is_available():
+                print("[Khởi tạo] GPU phát hiện nhưng sẽ sử dụng CPU để tương thích")
             print(f"[Khởi tạo] Đang tải mô hình Transformers: {TRANSFORMER_MODEL_NAME}...")
             self.transformer_tokenizer = AutoTokenizer.from_pretrained(TRANSFORMER_MODEL_NAME)
             self.transformer_model = AutoModel.from_pretrained(TRANSFORMER_MODEL_NAME)
+            # Đảm bảo model chạy trên CPU
+            self.transformer_model = self.transformer_model.to('cpu')
             self.transformer_model.eval()  # Chế độ evaluation
-            print("[Khởi tạo] Đã tải mô hình Transformers thành công")
+            print("[Khởi tạo] Đã tải mô hình Transformers thành công (CPU mode)")
+        except ImportError as e:
+            print(f"[Cảnh báo] Không tìm thấy PyTorch: {e}")
+            print("Vui lòng cài đặt: pip install torch --index-url https://download.pytorch.org/whl/cpu")
+            print("Chương trình sẽ tiếp tục chỉ sử dụng spaCy")
+            self.transformer_tokenizer = None
+            self.transformer_model = None
         except Exception as e:
             print(f"[Cảnh báo] Không thể tải mô hình Transformers: {e}")
             print("Chương trình sẽ tiếp tục chỉ sử dụng spaCy")

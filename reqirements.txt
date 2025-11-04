@@ -10,7 +10,12 @@ threadpoolctl==3.6.0
 tzdata==2025.2
 spacy>=3.7.0
 transformers>=4.30.0
-torch>=2.0.0
+
+# PyTorch CPU-only (KHÔNG cần NVIDIA driver/CUDA)
+# Cài đặt theo hệ điều hành:
+# Linux: pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Hoặc: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+# Windows/Mac: pip install torch torchvision torchaudio
 
 # Lưu ý: Sau khi cài đặt spacy, bạn cần tải mô hình ngôn ngữ:
 # python -m spacy download en_core_web_lg
