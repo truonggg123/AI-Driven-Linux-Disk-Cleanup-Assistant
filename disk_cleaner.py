@@ -7,6 +7,8 @@ import sys
 import joblib # Thư viện để tải mô hình đã huấn luyện
 from pathlib import Path
 import spacy
+from transformers import AutoTokenizer, AutoModel
+import torch
 
 # ==================== CẤU HÌNH VÀ VỊ TRÍ LƯU TRỮ MÔ HÌNH ====================
 # Thư mục lưu trữ mô hình đã huấn luyện (Được tạo bởi train_model.py)
@@ -25,10 +27,33 @@ COMPRESS_TIME_THRESHOLD = 90              # 90 ngày
 COMPRESSED_EXTS = [".zip", ".rar", ".7z", ".tar.gz", ".gz"]
 # ==============================================================================
 
-# ----------------- HÀM TRÍCH XUẤT FEATURES TỪ TÊN FILE BẰNG SPACY -----------------
-def extract_spacy_features(file_path, nlp_model):
+# ----------------- HÀM TRÍCH XUẤT EMBEDDING TỪ TRANSFORMERS -----------------
+def get_transformer_embedding(text, tokenizer, model, max_length=128):
     """
-    Trích xuất features từ tên file sử dụng spaCy NLP.
+    Lấy embedding từ transformer model.
+    """
+    if tokenizer is None or model is None:
+        return None
+    
+    try:
+        # Tokenize
+        inputs = tokenizer(text, return_tensors="pt", max_length=max_length, 
+                          truncation=True, padding=True)
+        
+        # Lấy embeddings
+        with torch.no_grad():
+            outputs = model(**inputs)
+            # Lấy mean pooling của token embeddings
+            embeddings = outputs.last_hidden_state.mean(dim=1).squeeze()
+        
+        return embeddings.numpy()
+    except Exception as e:
+        return None
+
+# ----------------- HÀM TRÍCH XUẤT FEATURES TỪ TÊN FILE BẰNG SPACY + TRANSFORMERS -----------------
+def extract_spacy_features(file_path, nlp_model, transformer_tokenizer=None, transformer_model=None):
+    """
+    Trích xuất features từ tên file sử dụng kết hợp spaCy và Transformers.
     Trả về: dict chứa các features từ NLP
     """
     # Lấy tên file không có extension
@@ -51,18 +76,27 @@ def extract_spacy_features(file_path, nlp_model):
     important_keywords = ['important', 'final', 'document', 'report']
     has_important_keyword = any(keyword in file_name for keyword in important_keywords)
     
-    # Feature 5: Embedding vector từ tên file (giảm chiều bằng PCA sau)
+    # Feature 5: Embedding vector từ spaCy (300D từ en_core_web_lg)
     if len(doc) > 0 and doc.vector is not None:
-        embedding_vector = doc.vector  # Vector 300D từ en_core_web_lg
+        spacy_embedding = doc.vector  # Vector 300D từ en_core_web_lg
     else:
-        embedding_vector = np.zeros(300)  # Vector 0 nếu không có token
+        spacy_embedding = np.zeros(300)  # Vector 0 nếu không có token
+    
+    # Feature 6: Embedding vector từ Transformers (384D từ all-MiniLM-L6-v2)
+    transformer_embedding = get_transformer_embedding(file_name, transformer_tokenizer, transformer_model)
+    if transformer_embedding is None or len(transformer_embedding) != 384:
+        transformer_embedding = np.zeros(384)  # Vector 0 nếu không có transformer
+    
+    # Kết hợp cả hai embeddings (sẽ giảm chiều bằng PCA sau)
+    # Luôn luôn 684D: 300D (spaCy) + 384D (Transformers)
+    combined_embedding = np.concatenate([spacy_embedding, transformer_embedding])  # 300 + 384 = 684D
     
     return {
         'num_words': num_words,
         'name_length': name_length,
         'has_temp_keyword': int(has_temp_keyword),
         'has_important_keyword': int(has_important_keyword),
-        'embedding_vector': embedding_vector
+        'embedding_vector': combined_embedding
     }
 
 # ----------------- HÀM THU THẬP METADATA THẬT -----------------
@@ -107,10 +141,10 @@ def collect_real_metadata(target_dir_path):
     return pd.DataFrame(file_data_list)
 
 # -------------------- HÀM CHỈ TÍNH TOÁN FEATURE --------------------
-def calculate_features(df, nlp_model, pca_transformer):
+def calculate_features(df, nlp_model, pca_transformer, transformer_tokenizer=None, transformer_model=None):
     """
     Tính toán Features (đặc trưng) cần thiết cho mô hình.
-    Bao gồm các features từ spaCy giống như trong train_model.py
+    Bao gồm các features từ spaCy + Transformers giống như trong train_model.py
     """
     if df.empty:
         return df
@@ -124,13 +158,13 @@ def calculate_features(df, nlp_model, pca_transformer):
     
     # Đặc trưng 3: Thời gian kể từ lần truy cập cuối cùng (days_since_access)
     
-    # Trích xuất features từ tên file bằng spaCy
-    print("   Đang trích xuất features từ tên file bằng spaCy...")
+    # Trích xuất features từ tên file bằng spaCy + Transformers
+    print("   Đang trích xuất features từ tên file bằng spaCy + Transformers...")
     spacy_features = []
     embedding_vectors = []
     
     for idx, file_path in enumerate(df['file_path']):
-        features = extract_spacy_features(file_path, nlp_model)
+        features = extract_spacy_features(file_path, nlp_model, transformer_tokenizer, transformer_model)
         spacy_features.append({
             'num_words': features['num_words'],
             'name_length': features['name_length'],
@@ -253,6 +287,21 @@ def main():
         print("Vui lòng chạy: python -m spacy download en_core_web_lg")
         sys.exit(1)
     
+    # Khởi tạo Transformers model (sử dụng mô hình nhẹ cho text embeddings)
+    try:
+        # Sử dụng một mô hình nhẹ và nhanh cho embeddings
+        TRANSFORMER_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+        print(f"[BƯỚC 0] Đang tải mô hình Transformers: {TRANSFORMER_MODEL_NAME}...")
+        transformer_tokenizer = AutoTokenizer.from_pretrained(TRANSFORMER_MODEL_NAME)
+        transformer_model = AutoModel.from_pretrained(TRANSFORMER_MODEL_NAME)
+        transformer_model.eval()  # Chế độ evaluation
+        print("[BƯỚC 0] Đã tải mô hình Transformers thành công")
+    except Exception as e:
+        print(f"[CẢNH BÁO] Không thể tải mô hình Transformers: {e}")
+        print("Chương trình sẽ tiếp tục chỉ sử dụng spaCy")
+        transformer_tokenizer = None
+        transformer_model = None
+    
     # -------------------------------------------------------------
     # BƯỚC 1: XÁC ĐỊNH THƯ MỤC THẬT TẾ
     # -------------------------------------------------------------
@@ -273,7 +322,7 @@ def main():
         print("Không tìm thấy tệp nào đủ điều kiện để phân tích. Thoát chương trình.")
         sys.exit(0) 
         
-    real_df = calculate_features(real_metadata_df, nlp, pca) 
+    real_df = calculate_features(real_metadata_df, nlp, pca, transformer_tokenizer, transformer_model) 
     
     # -------------------------------------------------------------
     # BƯỚC 3: DỰ ĐOÁN & BÁO CÁO
@@ -283,8 +332,8 @@ def main():
     # Chọn các cột feature mà mô hình đã được huấn luyện (giống như khi train)
     feature_cols = ['size_log', 'days_since_access', 'is_temp_file',
                     'num_words', 'name_length', 'has_temp_keyword', 'has_important_keyword']
-    # Thêm các embedding dimensions
-    embedding_cols = [f'embedding_dim_{i}' for i in range(10)]
+    # Thêm các embedding dimensions (số lượng có thể thay đổi tùy theo PCA)
+    embedding_cols = [col for col in real_df.columns if col.startswith('embedding_dim_')]
     feature_cols.extend(embedding_cols)
     
     # Chỉ lấy các cột có trong DataFrame (tránh lỗi nếu thiếu)

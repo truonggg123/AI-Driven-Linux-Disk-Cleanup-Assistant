@@ -7,11 +7,13 @@ import joblib # Thư viện để lưu và tải mô hình
 from pathlib import Path
 
 # Thư viện cho Machine Learning
+from transformers import pipeline, AutoTokenizer, AutoModel
 from sklearn.model_selection import train_test_split
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.decomposition import PCA
 import spacy
+import torch
 
 # ==================== CẤU HÌNH DỮ LIỆU GIẢ VÀ LUẬT GÁN NHÃN ====================
 # Thư mục lưu trữ mô hình đã huấn luyện
@@ -23,6 +25,21 @@ except OSError:
     print("[LỖI] Không tìm thấy mô hình spaCy 'en_core_web_lg'.")
     print("Vui lòng chạy: python -m spacy download en_core_web_lg")
     sys.exit(1)
+
+# Khởi tạo Transformers model (sử dụng mô hình nhẹ cho text embeddings)
+try:
+    # Sử dụng một mô hình nhẹ và nhanh cho embeddings
+    TRANSFORMER_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+    print(f"[INFO] Đang tải mô hình Transformers: {TRANSFORMER_MODEL_NAME}...")
+    transformer_tokenizer = AutoTokenizer.from_pretrained(TRANSFORMER_MODEL_NAME)
+    transformer_model = AutoModel.from_pretrained(TRANSFORMER_MODEL_NAME)
+    transformer_model.eval()  # Chế độ evaluation
+    print("[INFO] Đã tải mô hình Transformers thành công")
+except Exception as e:
+    print(f"[CẢNH BÁO] Không thể tải mô hình Transformers: {e}")
+    print("Chương trình sẽ tiếp tục chỉ sử dụng spaCy")
+    transformer_tokenizer = None
+    transformer_model = None
 
 ASSETS_DIR = Path("ml_assets")
 MODEL_FILE = ASSETS_DIR / "disk_model.joblib"
@@ -59,10 +76,33 @@ COMPRESSED_EXTS = [".zip", ".rar", ".7z", ".tar.gz", ".gz"]
 # ==============================================================================
 
 
-# ----------------- HÀM TRÍCH XUẤT FEATURES TỪ TÊN FILE BẰNG SPACY -----------------
+# ----------------- HÀM TRÍCH XUẤT EMBEDDING TỪ TRANSFORMERS -----------------
+def get_transformer_embedding(text, tokenizer, model, max_length=128):
+    """
+    Lấy embedding từ transformer model.
+    """
+    if tokenizer is None or model is None:
+        return None
+    
+    try:
+        # Tokenize
+        inputs = tokenizer(text, return_tensors="pt", max_length=max_length, 
+                          truncation=True, padding=True)
+        
+        # Lấy embeddings
+        with torch.no_grad():
+            outputs = model(**inputs)
+            # Lấy mean pooling của token embeddings
+            embeddings = outputs.last_hidden_state.mean(dim=1).squeeze()
+        
+        return embeddings.numpy()
+    except Exception as e:
+        return None
+
+# ----------------- HÀM TRÍCH XUẤT FEATURES TỪ TÊN FILE BẰNG SPACY + TRANSFORMERS -----------------
 def extract_spacy_features(file_path):
     """
-    Trích xuất features từ tên file sử dụng spaCy NLP.
+    Trích xuất features từ tên file sử dụng kết hợp spaCy và Transformers.
     Trả về: dict chứa các features từ NLP
     """
     # Lấy tên file không có extension
@@ -85,19 +125,27 @@ def extract_spacy_features(file_path):
     important_keywords = ['important', 'final', 'document', 'report']
     has_important_keyword = any(keyword in file_name for keyword in important_keywords)
     
-    # Feature 5: Embedding vector từ tên file (giảm chiều bằng PCA sau)
-    # Sử dụng vector trung bình của các token
+    # Feature 5: Embedding vector từ spaCy (300D từ en_core_web_lg)
     if len(doc) > 0 and doc.vector is not None:
-        embedding_vector = doc.vector  # Vector 300D từ en_core_web_lg
+        spacy_embedding = doc.vector  # Vector 300D từ en_core_web_lg
     else:
-        embedding_vector = np.zeros(300)  # Vector 0 nếu không có token
+        spacy_embedding = np.zeros(300)  # Vector 0 nếu không có token
+    
+    # Feature 6: Embedding vector từ Transformers (384D từ all-MiniLM-L6-v2)
+    transformer_embedding = get_transformer_embedding(file_name, transformer_tokenizer, transformer_model)
+    if transformer_embedding is None or len(transformer_embedding) != 384:
+        transformer_embedding = np.zeros(384)  # Vector 0 nếu không có transformer
+    
+    # Kết hợp cả hai embeddings (sẽ giảm chiều bằng PCA sau)
+    # Luôn luôn 684D: 300D (spaCy) + 384D (Transformers)
+    combined_embedding = np.concatenate([spacy_embedding, transformer_embedding])  # 300 + 384 = 684D
     
     return {
         'num_words': num_words,
         'name_length': name_length,
         'has_temp_keyword': int(has_temp_keyword),
         'has_important_keyword': int(has_important_keyword),
-        'embedding_vector': embedding_vector
+        'embedding_vector': combined_embedding
     }
 
 # ----------------- HÀM TẠO METADATA GIẢ TRONG BỘ NHỚ -----------------
@@ -143,8 +191,8 @@ def label_data(df):
     # Sử dụng log10 cho kích thước
     df['size_log'] = np.log10(df['size_bytes'] + 1)
     
-    # Trích xuất features từ tên file bằng spaCy
-    print("   Đang trích xuất features từ tên file bằng spaCy...")
+    # Trích xuất features từ tên file bằng spaCy + Transformers
+    print("   Đang trích xuất features từ tên file bằng spaCy + Transformers...")
     spacy_features = []
     embedding_vectors = []
     
@@ -212,12 +260,14 @@ def main():
     embedding_matrix = np.array(list(synthetic_df_labeled['_embedding_vector']))
     print(f"   Kích thước embedding vectors: {embedding_matrix.shape}")
     
-    # Sử dụng PCA để giảm từ 300D xuống 10D
-    pca = PCA(n_components=10, random_state=42)
+    # Sử dụng PCA để giảm chiều (từ 684D nếu có cả spaCy và Transformers, hoặc 300D nếu chỉ có spaCy)
+    # Giảm xuống 15D để giữ lại nhiều thông tin hơn từ cả hai nguồn
+    pca_components = min(15, embedding_matrix.shape[1] - 1)
+    pca = PCA(n_components=pca_components, random_state=42)
     embedding_reduced = pca.fit_transform(embedding_matrix)
     
     # Tạo tên cột cho embedding features
-    embedding_cols = [f'embedding_dim_{i}' for i in range(10)]
+    embedding_cols = [f'embedding_dim_{i}' for i in range(embedding_reduced.shape[1])]
     embedding_df = pd.DataFrame(embedding_reduced, columns=embedding_cols, index=synthetic_df_labeled.index)
     
     # Kết hợp tất cả features
@@ -241,8 +291,8 @@ def main():
     X_train, X_test, y_train, y_test = train_test_split(
         X_synth, y_encoded_synth, test_size=0.2, random_state=42)
 
-    print("\n[BƯỚC 3] Bắt đầu huấn luyện mô hình Decision Tree với features từ spaCy...")
-    model = DecisionTreeClassifier(max_depth=8, random_state=42)  # Tăng depth để xử lý nhiều features hơn
+    print("\n[BƯỚC 3] Bắt đầu huấn luyện mô hình Decision Tree với features từ spaCy + Transformers...")
+    model = DecisionTreeClassifier(max_depth=10, random_state=42)  # Tăng depth để xử lý nhiều features hơn
     model.fit(X_train, y_train)
 
     accuracy = model.score(X_test, y_test)
